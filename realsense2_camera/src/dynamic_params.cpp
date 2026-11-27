@@ -16,6 +16,31 @@
 
 namespace realsense2_camera
 {
+    namespace
+    {
+        void try_undeclare_parameter(RosNodeBase& node, const std::string& param_name)
+        {
+            try
+            {
+                if (!node.has_parameter(param_name))
+                {
+                    return;
+                }
+                if (node.describe_parameter(param_name).read_only)
+                {
+                    return;
+                }
+                node.undeclare_parameter(param_name);
+            }
+            catch (const rclcpp::exceptions::ParameterImmutableException&)
+            {
+            }
+            catch (const rclcpp::exceptions::ParameterNotDeclaredException&)
+            {
+            }
+        }
+    }  // namespace
+
     Parameters::Parameters(RosNodeBase& node) :
     _node(node),
     _logger(node.get_logger()),
@@ -102,7 +127,7 @@ namespace realsense2_camera
             _update_functions_t->join();
         for (auto const& param : _param_functions)
         {
-            _node.undeclare_parameter(param.first);
+            try_undeclare_parameter(_node, param.first);
         }
         // remove_on_set_parameters_callback(_params_backend);
     }
@@ -274,10 +299,7 @@ namespace realsense2_camera
 
     void Parameters::removeParam(std::string param_name)
     {
-        if (_node.has_parameter(param_name))
-        {
-            _node.undeclare_parameter(param_name);
-        }
+        try_undeclare_parameter(_node, param_name);
         _param_functions.erase(param_name);
     }
 
