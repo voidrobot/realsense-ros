@@ -114,6 +114,7 @@ BaseRealSenseNode::BaseRealSenseNode(RosNodeBase& node,
     _diagnostics_period(0),
     _use_intra_process(use_intra_process),
     _use_qirp_transport(false),
+    _qirp_dmabuf_pool_size(8),
     _is_initialized_time_base(false),
     _camera_time_base(0),
     _sync_frames(SYNC_FRAMES),
@@ -253,10 +254,10 @@ void BaseRealSenseNode::setupFilters()
 
 #if defined (ACCELERATE_GPU_WITH_GLSL)
     _colorizer_filter = std::make_shared<NamedFilter>(std::make_shared<rs2::gl::colorizer>(), _parameters, _logger); 
-    _pc_filter = std::make_shared<PointcloudFilter>(std::make_shared<rs2::gl::pointcloud>(), _node, _parameters, _logger, false, _use_qirp_transport);
+    _pc_filter = std::make_shared<PointcloudFilter>(std::make_shared<rs2::gl::pointcloud>(), _node, _parameters, _logger, false, _use_qirp_transport, static_cast<std::size_t>(_qirp_dmabuf_pool_size));
 #else
     _colorizer_filter = std::make_shared<NamedFilter>(std::make_shared<rs2::colorizer>(), _parameters, _logger);
-    _pc_filter = std::make_shared<PointcloudFilter>(std::make_shared<rs2::pointcloud>(), _node, _parameters, _logger, false, _use_qirp_transport);
+    _pc_filter = std::make_shared<PointcloudFilter>(std::make_shared<rs2::pointcloud>(), _node, _parameters, _logger, false, _use_qirp_transport, static_cast<std::size_t>(_qirp_dmabuf_pool_size));
 #endif
 
     // Apply PointCloud filter before applying Align-depth as it requires original depth image not aligned-depth image.

@@ -100,6 +100,17 @@ void BaseRealSenseNode::getParameters()
     param_name = std::string("use_qirp_transport");
     _use_qirp_transport = _parameters->setParam<bool>(param_name, false);
     _parameters_names.push_back(param_name);
+
+    param_name = std::string("qirp_dmabuf_pool_size");
+    _qirp_dmabuf_pool_size = static_cast<int>(_parameters->setParam<int>(param_name, 8));
+    if (_qirp_dmabuf_pool_size < 0 || _qirp_dmabuf_pool_size > 32)
+    {
+        const int clamped = std::max(0, std::min(32, _qirp_dmabuf_pool_size));
+        ROS_WARN_STREAM("qirp_dmabuf_pool_size " << _qirp_dmabuf_pool_size
+                        << " out of [0,32]; clamping to " << clamped);
+        _qirp_dmabuf_pool_size = clamped;
+    }
+    _parameters_names.push_back(param_name);
 #ifndef BUILD_WITH_QIRP
     if (_use_qirp_transport)
     {
@@ -109,7 +120,8 @@ void BaseRealSenseNode::getParameters()
 #else
     if (_use_qirp_transport)
     {
-        ROS_INFO("QIRP DMA-BUF Zero-Copy transport enabled for supported image streams (rgb8/nv12) and PointCloud2.");
+        ROS_INFO_STREAM("QIRP DMA-BUF Zero-Copy transport enabled for supported image streams (rgb8/nv12) and PointCloud2 (pool_size="
+                        << _qirp_dmabuf_pool_size << ").");
     }
 #endif
 

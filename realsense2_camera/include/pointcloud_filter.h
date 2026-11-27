@@ -23,6 +23,7 @@
 #include "named_filter.h"
 
 #ifdef BUILD_WITH_QIRP
+#include "dmabuf_pool.h"
 #include <qrb_ros_transport_point_cloud2_type/point_cloud2.hpp>
 #endif
 
@@ -36,7 +37,8 @@ namespace realsense2_camera
                              std::shared_ptr<Parameters> parameters,
                              rclcpp::Logger logger,
                              bool is_enabled=false,
-                             bool use_qirp_transport=false);
+                             bool use_qirp_transport=false,
+                             std::size_t qirp_pool_size=8);
 
             void setPublisher();
             void Publish(rs2::points pc, const rclcpp::Time& t, const rs2::frameset& frameset, const std::string& frame_id);
@@ -54,6 +56,7 @@ namespace realsense2_camera
             rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr _pointcloud_publisher;
 #ifdef BUILD_WITH_QIRP
             rclcpp::Publisher<qrb_ros::transport::type::PointCloud2>::SharedPtr _qirp_pointcloud_publisher;
+            DmaBufferPool _dmabuf_pool;
 #endif
             std::string _pointcloud_qos;
     };

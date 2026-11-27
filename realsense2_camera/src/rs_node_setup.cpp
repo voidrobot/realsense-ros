@@ -295,7 +295,8 @@ void BaseRealSenseNode::startPublishers(const std::vector<stream_profile>& profi
                     if (enc_it != _rs_format_to_ros_format.end() &&
                         qrb_ros::transport::image_utils::is_support_encoding(enc_it->second))
                     {
-                        _image_publishers[sip] = std::make_shared<image_qirp_publisher>(_node, image_raw.str(), qos);
+                        _image_publishers[sip] = std::make_shared<image_qirp_publisher>(
+                            _node, image_raw.str(), qos, static_cast<std::size_t>(_qirp_dmabuf_pool_size));
                         created_qirp_pub = true;
                         ROS_INFO_STREAM("QIRP DMA-BUF publisher created for topic " << image_raw.str()
                                         << " (encoding=" << enc_it->second << ")");

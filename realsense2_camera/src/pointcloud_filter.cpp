@@ -26,13 +26,20 @@ PointcloudFilter::PointcloudFilter(std::shared_ptr<rs2::filter> filter,
                                    std::shared_ptr<Parameters> parameters,
                                    rclcpp::Logger logger,
                                    bool is_enabled,
-                                   bool use_qirp_transport):
+                                   bool use_qirp_transport,
+                                   std::size_t qirp_pool_size):
     NamedFilter(filter, parameters, logger, is_enabled, false),
     _node(node),
     _allow_no_texture_points(ALLOW_NO_TEXTURE_POINTS),
     _ordered_pc(ORDERED_PC),
     _use_qirp_transport(use_qirp_transport)
+#ifdef BUILD_WITH_QIRP
+    , _dmabuf_pool(qirp_pool_size)
+#endif
     {
+#ifndef BUILD_WITH_QIRP
+        (void)qirp_pool_size;
+#endif
         setParameters();
     }
 
@@ -214,12 +221,12 @@ void PointcloudFilter::Publish(rs2::points pc, const rclcpp::Time& t, const rs2:
         const size_t pc_size = pc.size();
         const uint32_t point_step = layout.point_step;
         const uint32_t color_offset = (use_texture && !layout.fields.empty()) ? layout.fields.back().offset : 0;
+        const bool use_pool = (_dmabuf_pool.max_slots() > 0);
 
-        // Determine exact point count so DmaBuffer::size() == height * row_step (bit-exact with convert_to_ros_message)
-        size_t out_points = pc_size;
-        if (!_ordered_pc)
+        size_t alloc_points = pc_size;
+        if (!use_pool && !_ordered_pc)
         {
-            out_points = 0;
+            alloc_points = 0;
             const rs2::vertex* v_cnt = vertex;
             const rs2::texture_coordinate* uv_cnt = color_point;
             if (use_texture)
@@ -228,7 +235,7 @@ void PointcloudFilter::Publish(rs2::points pc, const rclcpp::Time& t, const rs2:
                 {
                     const bool valid_color_pixel = (uv_cnt->u >= 0.f && uv_cnt->u <= 1.f && uv_cnt->v >= 0.f && uv_cnt->v <= 1.f);
                     if (v_cnt->z > 0 && (valid_color_pixel || _allow_no_texture_points))
-                        ++out_points;
+                        ++alloc_points;
                 }
             }
             else
@@ -236,24 +243,24 @@ void PointcloudFilter::Publish(rs2::points pc, const rclcpp::Time& t, const rs2:
                 for (size_t idx = 0; idx < pc_size; ++idx, ++v_cnt)
                 {
                     if (v_cnt->z > 0)
-                        ++out_points;
+                        ++alloc_points;
                 }
             }
         }
 
-        const size_t out_bytes = out_points * static_cast<size_t>(point_step);
+        const size_t alloc_bytes = alloc_points * static_cast<size_t>(point_step);
         std::shared_ptr<lib_mem_dmabuf::DmaBuffer> dmabuf;
-        if (out_bytes > 0)
+        size_t written = 0;
+        if (alloc_bytes > 0)
         {
-            dmabuf = lib_mem_dmabuf::DmaBuffer::alloc(out_bytes, "/dev/dma_heap/system");
-            if (!dmabuf || !dmabuf->map())
+            dmabuf = _dmabuf_pool.acquire(alloc_bytes);
+            if (!dmabuf || !dmabuf->addr())
             {
                 ROS_ERROR("QIRP PointCloud2 DmaBuffer allocation/map failed. Frame dropped.");
                 return;
             }
             dmabuf->sync_start();
             auto* dst_base = static_cast<uint8_t*>(dmabuf->addr());
-            size_t written = 0;
 
             if (use_texture)
             {
@@ -307,7 +314,10 @@ void PointcloudFilter::Publish(rs2::points pc, const rclcpp::Time& t, const rs2:
                 }
             }
             dmabuf->sync_end();
-            dmabuf->unmap();
+            if (!use_pool)
+            {
+                dmabuf->unmap();
+            }
         }
 
         auto qirp_msg = std::make_unique<qrb_ros::transport::type::PointCloud2>();
@@ -324,7 +334,7 @@ void PointcloudFilter::Publish(rs2::points pc, const rclcpp::Time& t, const rs2:
         }
         else
         {
-            qirp_msg->width = static_cast<uint32_t>(out_points);
+            qirp_msg->width = static_cast<uint32_t>(written);
             qirp_msg->height = 1;
             qirp_msg->is_dense = true;
         }

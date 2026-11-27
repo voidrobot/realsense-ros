@@ -64,10 +64,15 @@ size_t image_transport_publisher::get_subscription_count() const
 }
 
 #ifdef BUILD_WITH_QIRP
+#include <cstring>
+#include <sensor_msgs/image_encodings.hpp>
+
 // --- image_qirp_publisher implementation ---
 image_qirp_publisher::image_qirp_publisher( RosNodeBase & node,
                                             const std::string & topic_name,
-                                            const rmw_qos_profile_t & qos )
+                                            const rmw_qos_profile_t & qos,
+                                            std::size_t pool_size )
+    : _dmabuf_pool( pool_size )
 {
     image_publisher_impl = node.create_publisher< qrb_ros::transport::type::Image >(
         topic_name,
@@ -90,12 +95,43 @@ bool image_qirp_publisher::publish_raw( const std_msgs::msg::Header & header,
     if (align_size <= 0)
         return false;
 
-    auto dmabuf = lib_mem_dmabuf::DmaBuffer::alloc(static_cast<std::size_t>(align_size), "/dev/dma_heap/system");
-    if (!dmabuf)
-        return false;
+    std::shared_ptr<lib_mem_dmabuf::DmaBuffer> dmabuf;
+    if (encoding == sensor_msgs::image_encodings::RGB8 && _dmabuf_pool.max_slots() > 0)
+    {
+        const int dst_stride = qrb_ros::transport::image_utils::get_image_stride(width, encoding);
+        if (dst_stride < step)
+            return false;
 
-    if (!qrb_ros::transport::image_utils::save_image_to_dmabuf(dmabuf, data, width, height, step, encoding, true))
-        return false;
+        dmabuf = _dmabuf_pool.acquire(static_cast<std::size_t>(align_size));
+        if (!dmabuf || !dmabuf->addr())
+            return false;
+
+        dmabuf->sync_start();
+        auto* dst = static_cast<uint8_t*>(dmabuf->addr());
+        const auto* src = static_cast<const uint8_t*>(data);
+        if (dst_stride == step)
+        {
+            std::memcpy(dst, src, static_cast<std::size_t>(height) * static_cast<std::size_t>(step));
+        }
+        else
+        {
+            for (int y = 0; y < height; ++y)
+            {
+                std::memcpy(dst + static_cast<std::size_t>(y) * static_cast<std::size_t>(dst_stride),
+                            src + static_cast<std::size_t>(y) * static_cast<std::size_t>(step),
+                            static_cast<std::size_t>(step));
+            }
+        }
+        dmabuf->sync_end();
+    }
+    else
+    {
+        dmabuf = lib_mem_dmabuf::DmaBuffer::alloc(static_cast<std::size_t>(align_size), "/dev/dma_heap/system");
+        if (!dmabuf)
+            return false;
+        if (!qrb_ros::transport::image_utils::save_image_to_dmabuf(dmabuf, data, width, height, step, encoding, true))
+            return false;
+    }
 
     auto qirp_msg = std::make_unique< qrb_ros::transport::type::Image >();
     qirp_msg->header = header;

@@ -377,6 +377,7 @@ namespace realsense2_camera
 
         bool _use_intra_process;
         bool _use_qirp_transport;
+        int  _qirp_dmabuf_pool_size;
         std::map<stream_index_pair, std::shared_ptr<image_publisher>> _image_publishers;
         rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr _labeled_pointcloud_publisher;
         rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr _occupancy_publisher;

@@ -20,6 +20,7 @@
 #include <image_transport/image_transport.hpp>
 
 #ifdef BUILD_WITH_QIRP
+#include "dmabuf_pool.h"
 #include <qrb_ros_transport_image_type/image.hpp>
 #include <qrb_ros_transport_image_type/image_utils.hpp>
 #endif
@@ -80,7 +81,8 @@ class image_qirp_publisher : public image_publisher
 public:
     image_qirp_publisher( RosNodeBase & node,
                           const std::string & topic_name,
-                          const rmw_qos_profile_t & qos );
+                          const rmw_qos_profile_t & qos,
+                          std::size_t pool_size = 8 );
     void publish( sensor_msgs::msg::Image::UniquePtr image_ptr ) override;
     bool supports_raw_publish() const override { return true; }
     bool publish_raw( const std_msgs::msg::Header & header,
@@ -93,6 +95,7 @@ public:
 
 private:
     rclcpp::Publisher< qrb_ros::transport::type::Image >::SharedPtr image_publisher_impl;
+    DmaBufferPool _dmabuf_pool;
 };
 #endif
 

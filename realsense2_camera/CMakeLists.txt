@@ -257,7 +257,8 @@ set(INCLUDES
     include/align_depth_filter.h
     include/ros_param_backend.h
     include/profile_manager.h
-    include/image_publisher.h)
+    include/image_publisher.h
+    include/dmabuf_pool.h)
 
 if (BUILD_ACCELERATE_GPU_WITH_GLSL)
   list(APPEND INCLUDES include/gl_window.h)
