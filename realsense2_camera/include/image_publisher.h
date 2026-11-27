@@ -19,11 +19,27 @@
 
 #include <image_transport/image_transport.hpp>
 
+#ifdef BUILD_WITH_QIRP
+#include <qrb_ros_transport_image_type/image.hpp>
+#include <qrb_ros_transport_image_type/image_utils.hpp>
+#endif
+
 namespace realsense2_camera {
 class image_publisher
 {
 public:
     virtual void publish( sensor_msgs::msg::Image::UniquePtr image_ptr ) = 0;
+    virtual bool supports_raw_publish() const { return false; }
+    virtual bool publish_raw( const std_msgs::msg::Header & header,
+                              int width,
+                              int height,
+                              const std::string & encoding,
+                              int step,
+                              const void * data )
+    {
+        (void)header; (void)width; (void)height; (void)encoding; (void)step; (void)data;
+        return false;
+    }
     virtual size_t get_subscription_count() const = 0;
     virtual ~image_publisher() = default;
 };
@@ -55,5 +71,29 @@ public:
 private:
     std::shared_ptr< image_transport::Publisher > image_publisher_impl;
 };
+
+#ifdef BUILD_WITH_QIRP
+// Qualcomm QIRP DMA-BUF TypeAdapter image publisher (zero-copy for QIRP subscribers,
+// automatic TypeAdapter conversion to sensor_msgs::msg::Image for legacy subscribers).
+class image_qirp_publisher : public image_publisher
+{
+public:
+    image_qirp_publisher( RosNodeBase & node,
+                          const std::string & topic_name,
+                          const rmw_qos_profile_t & qos );
+    void publish( sensor_msgs::msg::Image::UniquePtr image_ptr ) override;
+    bool supports_raw_publish() const override { return true; }
+    bool publish_raw( const std_msgs::msg::Header & header,
+                      int width,
+                      int height,
+                      const std::string & encoding,
+                      int step,
+                      const void * data ) override;
+    size_t get_subscription_count() const override;
+
+private:
+    rclcpp::Publisher< qrb_ros::transport::type::Image >::SharedPtr image_publisher_impl;
+};
+#endif
 
 }  // namespace realsense2_camera

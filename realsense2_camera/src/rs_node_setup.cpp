@@ -283,25 +283,49 @@ void BaseRealSenseNode::startPublishers(const std::vector<stream_profile>& profi
                 camera_info << "~/" << stream_name << "/camera_info";
 
 
-                // We can use 2 types of publishers:
+                // We can use 2 types of publishers (or QIRP DMA-BUF publisher when enabled and encoding is supported):
                 // 1. Native RCL publisher (supports intra-process zero-copy communication)
                 // 2. Image-transport package publisher (adds a compressed image topic if installed)
 
-                #ifdef USE_LIFECYCLE_NODE
-                // Always use `image_rcl_publisher` when lifecycle nodes are enabled
-                _image_publishers[sip] = std::make_shared<image_rcl_publisher>(_node, image_raw.str(), qos);
-                #else
-                // 🚀 Use intra-process if enabled, otherwise use image_transport
-                if (_use_intra_process)
+                bool created_qirp_pub = false;
+                #ifdef BUILD_WITH_QIRP
+                if (_use_qirp_transport)
                 {
-                    _image_publishers[sip] = std::make_shared<image_rcl_publisher>(_node, image_raw.str(), qos);
-                }
-                else
-                {
-                    _image_publishers[sip] = std::make_shared<image_transport_publisher>(_node, image_raw.str(), qos);
-                    ROS_DEBUG_STREAM("image transport publisher was created for topic" << image_raw.str());
+                    const auto enc_it = _rs_format_to_ros_format.find(profile.format());
+                    if (enc_it != _rs_format_to_ros_format.end() &&
+                        qrb_ros::transport::image_utils::is_support_encoding(enc_it->second))
+                    {
+                        _image_publishers[sip] = std::make_shared<image_qirp_publisher>(_node, image_raw.str(), qos);
+                        created_qirp_pub = true;
+                        ROS_INFO_STREAM("QIRP DMA-BUF publisher created for topic " << image_raw.str()
+                                        << " (encoding=" << enc_it->second << ")");
+                    }
+                    else
+                    {
+                        ROS_INFO_STREAM("QIRP image transport does not support encoding for topic " << image_raw.str()
+                                        << " (rs2_format=" << rs2_format_to_string(profile.format())
+                                        << "); using standard ROS image publisher.");
+                    }
                 }
                 #endif
+                if (!created_qirp_pub)
+                {
+                    #ifdef USE_LIFECYCLE_NODE
+                    // Always use `image_rcl_publisher` when lifecycle nodes are enabled
+                    _image_publishers[sip] = std::make_shared<image_rcl_publisher>(_node, image_raw.str(), qos);
+                    #else
+                    // 🚀 Use intra-process if enabled, otherwise use image_transport
+                    if (_use_intra_process)
+                    {
+                        _image_publishers[sip] = std::make_shared<image_rcl_publisher>(_node, image_raw.str(), qos);
+                    }
+                    else
+                    {
+                        _image_publishers[sip] = std::make_shared<image_transport_publisher>(_node, image_raw.str(), qos);
+                        ROS_DEBUG_STREAM("image transport publisher was created for topic" << image_raw.str());
+                    }
+                    #endif
+                }
 
                 // create cameraInfo publishers only for non-SC streams
                 if(shouldPublishCameraInfo(sip))

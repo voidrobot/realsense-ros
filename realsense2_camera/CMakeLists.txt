@@ -32,6 +32,7 @@ option(BUILD_WITH_OPENMP "Use OpenMP" OFF)
 option(SET_USER_BREAK_AT_STARTUP "Set user wait point in startup (for debug)" OFF)
 # Define an option to enable or disable lifecycle nodes
 option(USE_LIFECYCLE_NODE "Enable lifecycle nodes (ON/OFF)" OFF)
+option(BUILD_WITH_QIRP "Enable Qualcomm QIRP DMA-BUF TypeAdapter support" OFF)
 
 # Compiler Defense Flags
 if(UNIX OR APPLE)
@@ -234,6 +235,14 @@ if (BUILD_ACCELERATE_GPU_WITH_GLSL)
   add_definitions(-DACCELERATE_GPU_WITH_GLSL)
 endif()
 
+if (BUILD_WITH_QIRP)
+  find_package(qrb_ros_transport_image_type REQUIRED)
+  find_package(qrb_ros_transport_point_cloud2_type REQUIRED)
+  find_package(lib_mem_dmabuf REQUIRED)
+  add_definitions(-DBUILD_WITH_QIRP)
+  message(STATUS "Building realsense2_camera with Qualcomm QIRP DMA-BUF TypeAdapter support.")
+endif()
+
 set(INCLUDES
     include/context_singleton_wrapper.h
     include/constants.h
@@ -319,6 +328,13 @@ else()
   list(APPEND targets realsense2::realsense2)
 endif()
 
+if (BUILD_WITH_QIRP)
+  list(APPEND dependencies
+    qrb_ros_transport_image_type
+    qrb_ros_transport_point_cloud2_type
+    lib_mem_dmabuf)
+endif()
+
 # If the flag is enabled, define the macro
 if(USE_LIFECYCLE_NODE)
     find_package(rclcpp_lifecycle REQUIRED)
@@ -344,6 +360,18 @@ install(FILES "${CMAKE_BINARY_DIR}/global_settings.yaml"
 target_link_libraries(${PROJECT_NAME}
   ${targets}
 )
+if (BUILD_WITH_QIRP)
+  ament_target_dependencies(${PROJECT_NAME}
+    qrb_ros_transport_image_type
+    qrb_ros_transport_point_cloud2_type
+    lib_mem_dmabuf
+  )
+  # Ensure workspace librealsense2 headers precede /opt/ros/jazzy/include injected by ament_target_dependencies
+  if (TARGET realsense2::realsense2)
+    target_include_directories(${PROJECT_NAME} BEFORE PRIVATE
+      $<TARGET_PROPERTY:realsense2::realsense2,INTERFACE_INCLUDE_DIRECTORIES>)
+  endif()
+endif()
 
 # Workaround: librealsense built with bundled DDS exports its own fastcdr
 # symbols from librealsense2.so, clashing at runtime with ROS 2's fastdds.

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <pointcloud_filter.h>
+#include <cstring>
 #include <fstream>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 
@@ -20,11 +21,17 @@
 using namespace realsense2_camera;
 
 
-PointcloudFilter::PointcloudFilter(std::shared_ptr<rs2::filter> filter, RosNodeBase& node, std::shared_ptr<Parameters> parameters, rclcpp::Logger logger, bool is_enabled):
+PointcloudFilter::PointcloudFilter(std::shared_ptr<rs2::filter> filter,
+                                   RosNodeBase& node,
+                                   std::shared_ptr<Parameters> parameters,
+                                   rclcpp::Logger logger,
+                                   bool is_enabled,
+                                   bool use_qirp_transport):
     NamedFilter(filter, parameters, logger, is_enabled, false),
     _node(node),
     _allow_no_texture_points(ALLOW_NO_TEXTURE_POINTS),
-    _ordered_pc(ORDERED_PC)
+    _ordered_pc(ORDERED_PC),
+    _use_qirp_transport(use_qirp_transport)
     {
         setParameters();
     }
@@ -67,6 +74,23 @@ void PointcloudFilter::setParameters()
 void PointcloudFilter::setPublisher()
 {
     std::lock_guard<std::mutex> lock_guard(_mutex_publisher);
+#ifdef BUILD_WITH_QIRP
+    if (_use_qirp_transport)
+    {
+        if ((_is_enabled) && (!_qirp_pointcloud_publisher))
+        {
+            _qirp_pointcloud_publisher = _node.create_publisher<qrb_ros::transport::type::PointCloud2>(
+                "~/depth/color/points",
+                rclcpp::QoS(rclcpp::QoSInitialization::from_rmw(qos_string_to_qos(_pointcloud_qos)),
+                            qos_string_to_qos(_pointcloud_qos)));
+        }
+        else if ((!_is_enabled) && (_qirp_pointcloud_publisher))
+        {
+            _qirp_pointcloud_publisher.reset();
+        }
+        return;
+    }
+#endif
     if ((_is_enabled) && (!_pointcloud_publisher))
     {
         _pointcloud_publisher = _node.create_publisher<sensor_msgs::msg::PointCloud2>("~/depth/color/points",
@@ -90,18 +114,32 @@ void reverse_memcpy(unsigned char* dst, const unsigned char* src, size_t n)
 
 void PointcloudFilter::Publish(rs2::points pc, const rclcpp::Time& t, const rs2::frameset& frameset, const std::string& frame_id)
 {
+#ifdef BUILD_WITH_QIRP
+    bool publish_qirp = false;
+#endif
     {
         std::lock_guard<std::mutex> lock_guard(_mutex_publisher);
-        if ((!_pointcloud_publisher) || (!(_pointcloud_publisher->get_subscription_count())))
-            return;
+#ifdef BUILD_WITH_QIRP
+        if (_use_qirp_transport)
+        {
+            if ((!_qirp_pointcloud_publisher) || (!(_qirp_pointcloud_publisher->get_subscription_count())))
+                return;
+            publish_qirp = true;
+        }
+        else
+#endif
+        {
+            if ((!_pointcloud_publisher) || (!(_pointcloud_publisher->get_subscription_count())))
+                return;
+        }
     }
-    
+
     rs2_stream texture_source_id = static_cast<rs2_stream>(_filter->get_option(rs2_option::RS2_OPTION_STREAM_FILTER));
     bool use_texture = texture_source_id != RS2_STREAM_ANY;
     static int warn_count(0);
     static const int DISPLAY_WARN_NUMBER(15);
     rs2::frameset::iterator texture_frame_itr = frameset.end();
-    
+
     if (use_texture)
     {
         std::set<rs2_format> available_formats{ rs2_format::RS2_FORMAT_RGB8, rs2_format::RS2_FORMAT_Y8, rs2_format::RS2_FORMAT_Z16 };
@@ -117,7 +155,7 @@ void PointcloudFilter::Publish(rs2::points pc, const rclcpp::Time& t, const rs2:
             return;
         }
         warn_count = 0;
-    } 
+    }
     else {
         warn_count++;
         std::string texture_source_name = _filter->get_option_value_description(
@@ -128,7 +166,7 @@ void PointcloudFilter::Publish(rs2::points pc, const rclcpp::Time& t, const rs2:
             warn_count == DISPLAY_WARN_NUMBER,
             "No matching stream for texture '" << texture_source_name
             << "'. Set 'pointcloud.stream_profile' to 'depth(1)', 'color(2)', or 'infrared(3)' to enable textured pointclouds."
-        );        
+        );
     }
 
     int texture_width(0), texture_height(0);
@@ -138,6 +176,167 @@ void PointcloudFilter::Publish(rs2::points pc, const rclcpp::Time& t, const rs2:
     const rs2::texture_coordinate* color_point = pc.get_texture_coordinates();
 
     rs2_intrinsics depth_intrin = pc.get_profile().as<rs2::video_stream_profile>().get_intrinsics();
+
+#ifdef BUILD_WITH_QIRP
+    if (publish_qirp)
+    {
+        // Build identical PointCloud2 field layout using the exact same ROS modifier helpers
+        sensor_msgs::msg::PointCloud2 layout;
+        sensor_msgs::PointCloud2Modifier modifier(layout);
+        modifier.setPointCloud2FieldsByString(1, "xyz");
+
+        uint8_t* color_data = nullptr;
+        std::string format_str;
+        if (use_texture)
+        {
+            rs2::video_frame texture_frame = (*texture_frame_itr).as<rs2::video_frame>();
+            texture_width = texture_frame.get_width();
+            texture_height = texture_frame.get_height();
+            num_colors = texture_frame.get_bytes_per_pixel();
+            color_data = static_cast<uint8_t*>(const_cast<void*>(texture_frame.get_data()));
+            switch(texture_frame.get_profile().format())
+            {
+                case RS2_FORMAT_RGB8:
+                    format_str = "rgb";
+                    break;
+                case RS2_FORMAT_Y8:
+                    format_str = "intensity";
+                    break;
+                case RS2_FORMAT_Z16:
+                    format_str = "";
+                    break;
+                default:
+                    throw std::runtime_error("Unhandled texture format passed in pointcloud " + std::to_string(texture_frame.get_profile().format()));
+            }
+            layout.point_step = addPointField(layout, format_str.c_str(), 1, sensor_msgs::msg::PointField::FLOAT32, layout.point_step);
+        }
+
+        const size_t pc_size = pc.size();
+        const uint32_t point_step = layout.point_step;
+        const uint32_t color_offset = (use_texture && !layout.fields.empty()) ? layout.fields.back().offset : 0;
+
+        // Determine exact point count so DmaBuffer::size() == height * row_step (bit-exact with convert_to_ros_message)
+        size_t out_points = pc_size;
+        if (!_ordered_pc)
+        {
+            out_points = 0;
+            const rs2::vertex* v_cnt = vertex;
+            const rs2::texture_coordinate* uv_cnt = color_point;
+            if (use_texture)
+            {
+                for (size_t idx = 0; idx < pc_size; ++idx, ++v_cnt, ++uv_cnt)
+                {
+                    const bool valid_color_pixel = (uv_cnt->u >= 0.f && uv_cnt->u <= 1.f && uv_cnt->v >= 0.f && uv_cnt->v <= 1.f);
+                    if (v_cnt->z > 0 && (valid_color_pixel || _allow_no_texture_points))
+                        ++out_points;
+                }
+            }
+            else
+            {
+                for (size_t idx = 0; idx < pc_size; ++idx, ++v_cnt)
+                {
+                    if (v_cnt->z > 0)
+                        ++out_points;
+                }
+            }
+        }
+
+        const size_t out_bytes = out_points * static_cast<size_t>(point_step);
+        std::shared_ptr<lib_mem_dmabuf::DmaBuffer> dmabuf;
+        if (out_bytes > 0)
+        {
+            dmabuf = lib_mem_dmabuf::DmaBuffer::alloc(out_bytes, "/dev/dma_heap/system");
+            if (!dmabuf || !dmabuf->map())
+            {
+                ROS_ERROR("QIRP PointCloud2 DmaBuffer allocation/map failed. Frame dropped.");
+                return;
+            }
+            dmabuf->sync_start();
+            auto* dst_base = static_cast<uint8_t*>(dmabuf->addr());
+            size_t written = 0;
+
+            if (use_texture)
+            {
+                const rs2::vertex* v_ptr = vertex;
+                const rs2::texture_coordinate* uv_ptr = color_point;
+                for (size_t point_idx = 0; point_idx < pc_size; ++point_idx, ++v_ptr, ++uv_ptr)
+                {
+                    const float i = uv_ptr->u;
+                    const float j = uv_ptr->v;
+                    const bool valid_color_pixel = (i >= 0.f && i <= 1.f && j >= 0.f && j <= 1.f);
+                    const bool valid_pixel = (v_ptr->z > 0 && (valid_color_pixel || _allow_no_texture_points));
+                    if (valid_pixel || _ordered_pc)
+                    {
+                        uint8_t* p = dst_base + written * point_step;
+                        std::memcpy(p + 0, &v_ptr->x, sizeof(float));
+                        std::memcpy(p + 4, &v_ptr->y, sizeof(float));
+                        std::memcpy(p + 8, &v_ptr->z, sizeof(float));
+                        // Zero padding + color field first so all trailing bytes match std::vector zero-init bit-exact
+                        if (point_step > 12)
+                        {
+                            std::memset(p + 12, 0, point_step - 12);
+                        }
+                        if (valid_color_pixel)
+                        {
+                            const int pixx = static_cast<int>(i * texture_width);
+                            const int pixy = static_cast<int>(j * texture_height);
+                            const int offset = (pixy * texture_width + pixx) * num_colors;
+                            reverse_memcpy(p + color_offset, color_data + offset, num_colors);  // PointCloud2 order of rgb is bgr.
+                        }
+                        ++written;
+                    }
+                }
+            }
+            else
+            {
+                const rs2::vertex* v_ptr = vertex;
+                for (size_t point_idx = 0; point_idx < pc_size; ++point_idx, ++v_ptr)
+                {
+                    if (v_ptr->z > 0 || _ordered_pc)
+                    {
+                        uint8_t* p = dst_base + written * point_step;
+                        std::memcpy(p + 0, &v_ptr->x, sizeof(float));
+                        std::memcpy(p + 4, &v_ptr->y, sizeof(float));
+                        std::memcpy(p + 8, &v_ptr->z, sizeof(float));
+                        if (point_step > 12)
+                        {
+                            std::memset(p + 12, 0, point_step - 12);
+                        }
+                        ++written;
+                    }
+                }
+            }
+            dmabuf->sync_end();
+            dmabuf->unmap();
+        }
+
+        auto qirp_msg = std::make_unique<qrb_ros::transport::type::PointCloud2>();
+        qirp_msg->header.stamp = t;
+        qirp_msg->header.frame_id = frame_id;
+        qirp_msg->fields = std::move(layout.fields);
+        qirp_msg->is_bigendian = layout.is_bigendian;
+        qirp_msg->point_step = point_step;
+        if (_ordered_pc)
+        {
+            qirp_msg->width = static_cast<uint32_t>(depth_intrin.width);
+            qirp_msg->height = static_cast<uint32_t>(depth_intrin.height);
+            qirp_msg->is_dense = false;
+        }
+        else
+        {
+            qirp_msg->width = static_cast<uint32_t>(out_points);
+            qirp_msg->height = 1;
+            qirp_msg->is_dense = true;
+        }
+        qirp_msg->row_step = qirp_msg->width * qirp_msg->point_step;
+        qirp_msg->data_fd = std::move(dmabuf);
+
+        std::lock_guard<std::mutex> lock_guard(_mutex_publisher);
+        if (_qirp_pointcloud_publisher)
+            _qirp_pointcloud_publisher->publish(std::move(qirp_msg));
+        return;
+    }
+#endif
 
     sensor_msgs::msg::PointCloud2::UniquePtr msg_pointcloud = std::make_unique<sensor_msgs::msg::PointCloud2>();
 

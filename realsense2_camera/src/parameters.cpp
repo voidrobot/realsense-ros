@@ -97,6 +97,22 @@ void BaseRealSenseNode::getParameters()
     _tf_prefix = _parameters->setParam<std::string>(param_name, "");
     _parameters_names.push_back(param_name);
 
+    param_name = std::string("use_qirp_transport");
+    _use_qirp_transport = _parameters->setParam<bool>(param_name, false);
+    _parameters_names.push_back(param_name);
+#ifndef BUILD_WITH_QIRP
+    if (_use_qirp_transport)
+    {
+        ROS_WARN("use_qirp_transport:=true was requested, but realsense2_camera was built with BUILD_WITH_QIRP=OFF. Falling back to standard ROS publishers.");
+        _use_qirp_transport = false;
+    }
+#else
+    if (_use_qirp_transport)
+    {
+        ROS_INFO("QIRP DMA-BUF Zero-Copy transport enabled for supported image streams (rgb8/nv12) and PointCloud2.");
+    }
+#endif
+
 #if defined (ACCELERATE_GPU_WITH_GLSL)
     param_name = std::string("accelerate_gpu_with_glsl");
      _parameters->setParam<bool>(param_name, false, 

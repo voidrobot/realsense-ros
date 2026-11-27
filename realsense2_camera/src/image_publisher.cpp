@@ -62,3 +62,66 @@ size_t image_transport_publisher::get_subscription_count() const
 {
     return image_publisher_impl->getNumSubscribers();
 }
+
+#ifdef BUILD_WITH_QIRP
+// --- image_qirp_publisher implementation ---
+image_qirp_publisher::image_qirp_publisher( RosNodeBase & node,
+                                            const std::string & topic_name,
+                                            const rmw_qos_profile_t & qos )
+{
+    image_publisher_impl = node.create_publisher< qrb_ros::transport::type::Image >(
+        topic_name,
+        rclcpp::QoS( rclcpp::QoSInitialization::from_rmw( qos ), qos ) );
+}
+
+bool image_qirp_publisher::publish_raw( const std_msgs::msg::Header & header,
+                                        int width,
+                                        int height,
+                                        const std::string & encoding,
+                                        int step,
+                                        const void * data )
+{
+    if (!data || width <= 0 || height <= 0 || step <= 0)
+        return false;
+    if (!qrb_ros::transport::image_utils::is_support_encoding(encoding))
+        return false;
+
+    const int align_size = qrb_ros::transport::image_utils::get_image_align_size(width, height, encoding);
+    if (align_size <= 0)
+        return false;
+
+    auto dmabuf = lib_mem_dmabuf::DmaBuffer::alloc(static_cast<std::size_t>(align_size), "/dev/dma_heap/system");
+    if (!dmabuf)
+        return false;
+
+    if (!qrb_ros::transport::image_utils::save_image_to_dmabuf(dmabuf, data, width, height, step, encoding, true))
+        return false;
+
+    auto qirp_msg = std::make_unique< qrb_ros::transport::type::Image >();
+    qirp_msg->header = header;
+    qirp_msg->width = width;
+    qirp_msg->height = height;
+    qirp_msg->encoding = encoding;
+    qirp_msg->dmabuf = std::move(dmabuf);
+
+    image_publisher_impl->publish( std::move( qirp_msg ) );
+    return true;
+}
+
+void image_qirp_publisher::publish( sensor_msgs::msg::Image::UniquePtr image_ptr )
+{
+    if (!image_ptr)
+        return;
+    publish_raw(image_ptr->header,
+                static_cast<int>(image_ptr->width),
+                static_cast<int>(image_ptr->height),
+                image_ptr->encoding,
+                static_cast<int>(image_ptr->step),
+                image_ptr->data.data());
+}
+
+size_t image_qirp_publisher::get_subscription_count() const
+{
+    return image_publisher_impl->get_subscription_count();
+}
+#endif

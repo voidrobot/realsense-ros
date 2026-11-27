@@ -113,6 +113,7 @@ BaseRealSenseNode::BaseRealSenseNode(RosNodeBase& node,
     _tf_publish_rate(TF_PUBLISH_RATE),
     _diagnostics_period(0),
     _use_intra_process(use_intra_process),
+    _use_qirp_transport(false),
     _is_initialized_time_base(false),
     _camera_time_base(0),
     _sync_frames(SYNC_FRAMES),
@@ -252,10 +253,10 @@ void BaseRealSenseNode::setupFilters()
 
 #if defined (ACCELERATE_GPU_WITH_GLSL)
     _colorizer_filter = std::make_shared<NamedFilter>(std::make_shared<rs2::gl::colorizer>(), _parameters, _logger); 
-    _pc_filter = std::make_shared<PointcloudFilter>(std::make_shared<rs2::gl::pointcloud>(), _node, _parameters, _logger);
+    _pc_filter = std::make_shared<PointcloudFilter>(std::make_shared<rs2::gl::pointcloud>(), _node, _parameters, _logger, false, _use_qirp_transport);
 #else
     _colorizer_filter = std::make_shared<NamedFilter>(std::make_shared<rs2::colorizer>(), _parameters, _logger);
-    _pc_filter = std::make_shared<PointcloudFilter>(std::make_shared<rs2::pointcloud>(), _node, _parameters, _logger);
+    _pc_filter = std::make_shared<PointcloudFilter>(std::make_shared<rs2::pointcloud>(), _node, _parameters, _logger, false, _use_qirp_transport);
 #endif
 
     // Apply PointCloud filter before applying Align-depth as it requires original depth image not aligned-depth image.
@@ -1409,27 +1410,52 @@ void BaseRealSenseNode::publishFrame(
                 image_cv_matrix = images[stream];
             }
 
-            // Prepare image topic to be published
-            // We use UniquePtr for allow intra-process publish when subscribers of that type are available
-            sensor_msgs::msg::Image::UniquePtr img_msg_ptr(new sensor_msgs::msg::Image());
-            if (!img_msg_ptr)
+            if (image_publisher->supports_raw_publish() &&
+                !image_cv_matrix.empty() &&
+                _rs_format_to_ros_format.find(stream_format) != _rs_format_to_ros_format.end())
             {
-                ROS_ERROR("Sensor image message allocation failed. Frame was dropped.");
-                return;
-            }
-
-            if (fillROSImageMsgAndReturnStatus(image_cv_matrix, stream, width, height, stream_format, t, img_msg_ptr.get()))
-            {
-
-                // Transfer the unique pointer ownership to the RMW
-                sensor_msgs::msg::Image *msg_address = img_msg_ptr.get();
-                image_publisher->publish(std::move(img_msg_ptr));
-
-                ROS_DEBUG_STREAM(rs2_stream_to_string(f.get_profile().stream_type()) << " stream published, message address: " << std::hex << msg_address);
+                std_msgs::msg::Header header;
+                header.frame_id = OPTICAL_FRAME_ID(stream);
+                header.stamp = t;
+                const int step = static_cast<int>(width * image_cv_matrix.elemSize());
+                if (image_publisher->publish_raw(header,
+                                                 static_cast<int>(width),
+                                                 static_cast<int>(height),
+                                                 _rs_format_to_ros_format[stream_format],
+                                                 step,
+                                                 image_cv_matrix.data))
+                {
+                    ROS_DEBUG_STREAM(rs2_stream_to_string(f.get_profile().stream_type()) << " stream published via QIRP DMA-BUF");
+                }
+                else
+                {
+                    ROS_ERROR("Could not publish QIRP DMA-BUF image message. Frame was dropped.");
+                }
             }
             else
             {
-                ROS_ERROR("Could not fill ROS message. Frame was dropped.");
+                // Prepare image topic to be published
+                // We use UniquePtr for allow intra-process publish when subscribers of that type are available
+                sensor_msgs::msg::Image::UniquePtr img_msg_ptr(new sensor_msgs::msg::Image());
+                if (!img_msg_ptr)
+                {
+                    ROS_ERROR("Sensor image message allocation failed. Frame was dropped.");
+                    return;
+                }
+
+                if (fillROSImageMsgAndReturnStatus(image_cv_matrix, stream, width, height, stream_format, t, img_msg_ptr.get()))
+                {
+
+                    // Transfer the unique pointer ownership to the RMW
+                    sensor_msgs::msg::Image *msg_address = img_msg_ptr.get();
+                    image_publisher->publish(std::move(img_msg_ptr));
+
+                    ROS_DEBUG_STREAM(rs2_stream_to_string(f.get_profile().stream_type()) << " stream published, message address: " << std::hex << msg_address);
+                }
+                else
+                {
+                    ROS_ERROR("Could not fill ROS message. Frame was dropped.");
+                }
             }
         }
     }

@@ -22,13 +22,22 @@
 #include <ros_sensor.h>
 #include "named_filter.h"
 
+#ifdef BUILD_WITH_QIRP
+#include <qrb_ros_transport_point_cloud2_type/point_cloud2.hpp>
+#endif
+
 namespace realsense2_camera
 {
     class PointcloudFilter : public NamedFilter
     {
         public:
-            PointcloudFilter(std::shared_ptr<rs2::filter> filter, RosNodeBase& node, std::shared_ptr<Parameters> parameters, rclcpp::Logger logger, bool is_enabled=false);
-        
+            PointcloudFilter(std::shared_ptr<rs2::filter> filter,
+                             RosNodeBase& node,
+                             std::shared_ptr<Parameters> parameters,
+                             rclcpp::Logger logger,
+                             bool is_enabled=false,
+                             bool use_qirp_transport=false);
+
             void setPublisher();
             void Publish(rs2::points pc, const rclcpp::Time& t, const rs2::frameset& frameset, const std::string& frame_id);
 
@@ -40,8 +49,12 @@ namespace realsense2_camera
             RosNodeBase& _node;
             bool _allow_no_texture_points;
             bool _ordered_pc;
+            bool _use_qirp_transport;
             std::mutex _mutex_publisher;
             rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr _pointcloud_publisher;
+#ifdef BUILD_WITH_QIRP
+            rclcpp::Publisher<qrb_ros::transport::type::PointCloud2>::SharedPtr _qirp_pointcloud_publisher;
+#endif
             std::string _pointcloud_qos;
     };
 }
