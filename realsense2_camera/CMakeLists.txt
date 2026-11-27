@@ -239,7 +239,6 @@ if (BUILD_WITH_QIRP)
   find_package(qrb_ros_transport_image_type REQUIRED)
   find_package(qrb_ros_transport_point_cloud2_type REQUIRED)
   find_package(lib_mem_dmabuf REQUIRED)
-  add_definitions(-DBUILD_WITH_QIRP)
   message(STATUS "Building realsense2_camera with Qualcomm QIRP DMA-BUF TypeAdapter support.")
 endif()
 
@@ -362,6 +361,7 @@ target_link_libraries(${PROJECT_NAME}
   ${targets}
 )
 if (BUILD_WITH_QIRP)
+  target_compile_definitions(${PROJECT_NAME} PRIVATE BUILD_WITH_QIRP)
   ament_target_dependencies(${PROJECT_NAME}
     qrb_ros_transport_image_type
     qrb_ros_transport_point_cloud2_type

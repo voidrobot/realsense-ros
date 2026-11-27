@@ -114,7 +114,7 @@ BaseRealSenseNode::BaseRealSenseNode(RosNodeBase& node,
     _diagnostics_period(0),
     _use_intra_process(use_intra_process),
     _use_qirp_transport(false),
-    _qirp_dmabuf_pool_size(8),
+    _qirp_dmabuf_pool_size(static_cast<int>(qirp_defaults::kDefaultPoolSize)),
     _is_initialized_time_base(false),
     _camera_time_base(0),
     _sync_frames(SYNC_FRAMES),
@@ -1415,16 +1415,15 @@ void BaseRealSenseNode::publishFrame(
                 !image_cv_matrix.empty() &&
                 _rs_format_to_ros_format.find(stream_format) != _rs_format_to_ros_format.end())
             {
-                std_msgs::msg::Header header;
-                header.frame_id = OPTICAL_FRAME_ID(stream);
-                header.stamp = t;
-                const int step = static_cast<int>(width * image_cv_matrix.elemSize());
-                if (image_publisher->publish_raw(header,
-                                                 static_cast<int>(width),
-                                                 static_cast<int>(height),
-                                                 _rs_format_to_ros_format[stream_format],
-                                                 step,
-                                                 image_cv_matrix.data))
+                RawImageView view;
+                view.header.frame_id = OPTICAL_FRAME_ID(stream);
+                view.header.stamp = t;
+                view.width = static_cast<int>(width);
+                view.height = static_cast<int>(height);
+                view.encoding = _rs_format_to_ros_format[stream_format];
+                view.step = static_cast<int>(image_cv_matrix.step);
+                view.data = image_cv_matrix.data;
+                if (image_publisher->publish_raw(view))
                 {
                     ROS_DEBUG_STREAM(rs2_stream_to_string(f.get_profile().stream_type()) << " stream published via QIRP DMA-BUF");
                 }

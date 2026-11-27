@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <pointcloud_filter.h>
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
@@ -119,6 +120,149 @@ void reverse_memcpy(unsigned char* dst, const unsigned char* src, size_t n)
 
 }
 
+PointcloudFilter::TextureInfo PointcloudFilter::extractTextureInfo(
+    rs2::frameset::iterator texture_frame_itr) const
+{
+    rs2::video_frame texture_frame = (*texture_frame_itr).as<rs2::video_frame>();
+    TextureInfo info;
+    info.width = texture_frame.get_width();
+    info.height = texture_frame.get_height();
+    info.bytes_per_pixel = texture_frame.get_bytes_per_pixel();
+    info.data = static_cast<const uint8_t*>(texture_frame.get_data());
+    switch (texture_frame.get_profile().format())
+    {
+        case RS2_FORMAT_RGB8:
+            info.field_name = "rgb";
+            break;
+        case RS2_FORMAT_Y8:
+            info.field_name = "intensity";
+            break;
+        case RS2_FORMAT_Z16:
+            // Depth can't be used as color texture — skip coloring
+            info.field_name = "";
+            break;
+        default:
+            throw std::runtime_error("Unhandled texture format passed in pointcloud " +
+                                     std::to_string(texture_frame.get_profile().format()));
+    }
+    return info;
+}
+
+#ifdef BUILD_WITH_QIRP
+const PointcloudFilter::PointCloudLayout& PointcloudFilter::getOrBuildLayout(
+    bool has_color_field,
+    const std::string& field_name)
+{
+    if (_cached_layout.initialized &&
+        _cached_layout.has_texture == has_color_field &&
+        _cached_layout.field_name == field_name)
+    {
+        return _cached_layout;
+    }
+
+    sensor_msgs::msg::PointCloud2 layout_msg;
+    sensor_msgs::PointCloud2Modifier modifier(layout_msg);
+    modifier.setPointCloud2FieldsByString(1, "xyz");
+    if (has_color_field && !field_name.empty())
+    {
+        layout_msg.point_step = addPointField(
+            layout_msg, field_name.c_str(), 1,
+            sensor_msgs::msg::PointField::FLOAT32, layout_msg.point_step);
+    }
+
+    _cached_layout.initialized = true;
+    _cached_layout.has_texture = has_color_field;
+    _cached_layout.field_name = field_name;
+    _cached_layout.is_bigendian = layout_msg.is_bigendian;
+    _cached_layout.point_step = layout_msg.point_step;
+    _cached_layout.color_offset =
+        (has_color_field && !layout_msg.fields.empty()) ? layout_msg.fields.back().offset : 0;
+    _cached_layout.fields = std::move(layout_msg.fields);
+    return _cached_layout;
+}
+
+size_t PointcloudFilter::countValidPoints(const rs2::vertex* vertices,
+                                          const rs2::texture_coordinate* tex_coords,
+                                          size_t pc_size,
+                                          bool use_texture) const
+{
+    size_t valid_points = 0;
+    if (use_texture)
+    {
+        for (size_t idx = 0; idx < pc_size; ++idx)
+        {
+            const auto& uv = tex_coords[idx];
+            const bool valid_color_pixel = (uv.u >= 0.f && uv.u <= 1.f && uv.v >= 0.f && uv.v <= 1.f);
+            if (vertices[idx].z > 0 && (valid_color_pixel || _allow_no_texture_points))
+                ++valid_points;
+        }
+    }
+    else
+    {
+        for (size_t idx = 0; idx < pc_size; ++idx)
+        {
+            if (vertices[idx].z > 0)
+                ++valid_points;
+        }
+    }
+    return valid_points;
+}
+
+size_t PointcloudFilter::packPointsToBuffer(uint8_t* dst_base,
+                                            const PointCloudLayout& layout,
+                                            const rs2::vertex* vertices,
+                                            const rs2::texture_coordinate* tex_coords,
+                                            size_t pc_size,
+                                            const TextureInfo* texture) const
+{
+    static_assert(sizeof(rs2::vertex) == 3 * sizeof(float), "rs2::vertex must be packed float[3]");
+    constexpr size_t kXyzBytes = sizeof(rs2::vertex);
+    const uint32_t point_step = layout.point_step;
+    const size_t tail_bytes = (point_step > kXyzBytes) ? (point_step - kXyzBytes) : 0;
+    const bool write_color = (texture != nullptr && !texture->field_name.empty() &&
+                              texture->data != nullptr && texture->width > 0 && texture->height > 0 &&
+                              texture->bytes_per_pixel > 0);
+    const bool use_texture = (texture != nullptr);
+    size_t written = 0;
+
+    for (size_t idx = 0; idx < pc_size; ++idx)
+    {
+        const rs2::vertex& v = vertices[idx];
+        bool valid_color_pixel = false;
+        bool valid_pixel = (v.z > 0);
+        if (use_texture)
+        {
+            const rs2::texture_coordinate& uv = tex_coords[idx];
+            valid_color_pixel = (uv.u >= 0.f && uv.u <= 1.f && uv.v >= 0.f && uv.v <= 1.f);
+            valid_pixel = (v.z > 0 && (valid_color_pixel || _allow_no_texture_points));
+        }
+
+        if (!valid_pixel && !_ordered_pc)
+            continue;
+
+        uint8_t* p = dst_base + written * point_step;
+        std::memcpy(p, &v, kXyzBytes);
+        if (tail_bytes > 0)
+        {
+            std::memset(p + kXyzBytes, 0, tail_bytes);
+        }
+        if (write_color && valid_color_pixel)
+        {
+            const rs2::texture_coordinate& uv = tex_coords[idx];
+            const int pixx = std::clamp(static_cast<int>(uv.u * texture->width), 0, texture->width - 1);
+            const int pixy = std::clamp(static_cast<int>(uv.v * texture->height), 0, texture->height - 1);
+            const size_t offset = (static_cast<size_t>(pixy) * static_cast<size_t>(texture->width) +
+                                   static_cast<size_t>(pixx)) * static_cast<size_t>(texture->bytes_per_pixel);
+            reverse_memcpy(p + layout.color_offset,
+                           texture->data + offset,
+                           static_cast<size_t>(texture->bytes_per_pixel));  // PointCloud2 order of rgb is bgr.
+        }
+        ++written;
+    }
+    return written;
+}
+#endif
+
 void PointcloudFilter::Publish(rs2::points pc, const rclcpp::Time& t, const rs2::frameset& frameset, const std::string& frame_id)
 {
 #ifdef BUILD_WITH_QIRP
@@ -187,145 +331,53 @@ void PointcloudFilter::Publish(rs2::points pc, const rclcpp::Time& t, const rs2:
 #ifdef BUILD_WITH_QIRP
     if (publish_qirp)
     {
-        // Build identical PointCloud2 field layout using the exact same ROS modifier helpers
-        sensor_msgs::msg::PointCloud2 layout;
-        sensor_msgs::PointCloud2Modifier modifier(layout);
-        modifier.setPointCloud2FieldsByString(1, "xyz");
-
-        uint8_t* color_data = nullptr;
-        std::string format_str;
+        TextureInfo texture_info;
+        const TextureInfo* texture_ptr = nullptr;
         if (use_texture)
         {
-            rs2::video_frame texture_frame = (*texture_frame_itr).as<rs2::video_frame>();
-            texture_width = texture_frame.get_width();
-            texture_height = texture_frame.get_height();
-            num_colors = texture_frame.get_bytes_per_pixel();
-            color_data = static_cast<uint8_t*>(const_cast<void*>(texture_frame.get_data()));
-            switch(texture_frame.get_profile().format())
-            {
-                case RS2_FORMAT_RGB8:
-                    format_str = "rgb";
-                    break;
-                case RS2_FORMAT_Y8:
-                    format_str = "intensity";
-                    break;
-                case RS2_FORMAT_Z16:
-                    format_str = "";
-                    break;
-                default:
-                    throw std::runtime_error("Unhandled texture format passed in pointcloud " + std::to_string(texture_frame.get_profile().format()));
-            }
-            layout.point_step = addPointField(layout, format_str.c_str(), 1, sensor_msgs::msg::PointField::FLOAT32, layout.point_step);
+            texture_info = extractTextureInfo(texture_frame_itr);
+            texture_ptr = &texture_info;
         }
+
+        const bool has_color_field = (texture_ptr != nullptr && !texture_ptr->field_name.empty());
+        const PointCloudLayout& layout = getOrBuildLayout(
+            has_color_field, has_color_field ? texture_ptr->field_name : std::string());
 
         const size_t pc_size = pc.size();
-        const uint32_t point_step = layout.point_step;
-        const uint32_t color_offset = (use_texture && !layout.fields.empty()) ? layout.fields.back().offset : 0;
         const bool use_pool = (_dmabuf_pool.max_slots() > 0);
-
-        size_t alloc_points = pc_size;
-        if (!use_pool && !_ordered_pc)
+        const size_t alloc_points =
+            (!use_pool && !_ordered_pc)
+                ? countValidPoints(vertex, color_point, pc_size, use_texture)
+                : pc_size;
+        const size_t alloc_bytes = alloc_points * static_cast<size_t>(layout.point_step);
+        if (alloc_bytes == 0)
         {
-            alloc_points = 0;
-            const rs2::vertex* v_cnt = vertex;
-            const rs2::texture_coordinate* uv_cnt = color_point;
-            if (use_texture)
-            {
-                for (size_t idx = 0; idx < pc_size; ++idx, ++v_cnt, ++uv_cnt)
-                {
-                    const bool valid_color_pixel = (uv_cnt->u >= 0.f && uv_cnt->u <= 1.f && uv_cnt->v >= 0.f && uv_cnt->v <= 1.f);
-                    if (v_cnt->z > 0 && (valid_color_pixel || _allow_no_texture_points))
-                        ++alloc_points;
-                }
-            }
-            else
-            {
-                for (size_t idx = 0; idx < pc_size; ++idx, ++v_cnt)
-                {
-                    if (v_cnt->z > 0)
-                        ++alloc_points;
-                }
-            }
+            return;
         }
 
-        const size_t alloc_bytes = alloc_points * static_cast<size_t>(point_step);
-        std::shared_ptr<lib_mem_dmabuf::DmaBuffer> dmabuf;
-        size_t written = 0;
-        if (alloc_bytes > 0)
+        auto dmabuf = _dmabuf_pool.acquire(alloc_bytes);
+        if (!dmabuf || !dmabuf->addr())
         {
-            dmabuf = _dmabuf_pool.acquire(alloc_bytes);
-            if (!dmabuf || !dmabuf->addr())
-            {
-                ROS_ERROR("QIRP PointCloud2 DmaBuffer allocation/map failed. Frame dropped.");
-                return;
-            }
-            dmabuf->sync_start();
-            auto* dst_base = static_cast<uint8_t*>(dmabuf->addr());
+            ROS_ERROR("QIRP PointCloud2 DmaBuffer allocation/map failed. Frame dropped.");
+            return;
+        }
 
-            if (use_texture)
-            {
-                const rs2::vertex* v_ptr = vertex;
-                const rs2::texture_coordinate* uv_ptr = color_point;
-                for (size_t point_idx = 0; point_idx < pc_size; ++point_idx, ++v_ptr, ++uv_ptr)
-                {
-                    const float i = uv_ptr->u;
-                    const float j = uv_ptr->v;
-                    const bool valid_color_pixel = (i >= 0.f && i <= 1.f && j >= 0.f && j <= 1.f);
-                    const bool valid_pixel = (v_ptr->z > 0 && (valid_color_pixel || _allow_no_texture_points));
-                    if (valid_pixel || _ordered_pc)
-                    {
-                        uint8_t* p = dst_base + written * point_step;
-                        std::memcpy(p + 0, &v_ptr->x, sizeof(float));
-                        std::memcpy(p + 4, &v_ptr->y, sizeof(float));
-                        std::memcpy(p + 8, &v_ptr->z, sizeof(float));
-                        // Zero padding + color field first so all trailing bytes match std::vector zero-init bit-exact
-                        if (point_step > 12)
-                        {
-                            std::memset(p + 12, 0, point_step - 12);
-                        }
-                        if (valid_color_pixel)
-                        {
-                            const int pixx = static_cast<int>(i * texture_width);
-                            const int pixy = static_cast<int>(j * texture_height);
-                            const int offset = (pixy * texture_width + pixx) * num_colors;
-                            reverse_memcpy(p + color_offset, color_data + offset, num_colors);  // PointCloud2 order of rgb is bgr.
-                        }
-                        ++written;
-                    }
-                }
-            }
-            else
-            {
-                const rs2::vertex* v_ptr = vertex;
-                for (size_t point_idx = 0; point_idx < pc_size; ++point_idx, ++v_ptr)
-                {
-                    if (v_ptr->z > 0 || _ordered_pc)
-                    {
-                        uint8_t* p = dst_base + written * point_step;
-                        std::memcpy(p + 0, &v_ptr->x, sizeof(float));
-                        std::memcpy(p + 4, &v_ptr->y, sizeof(float));
-                        std::memcpy(p + 8, &v_ptr->z, sizeof(float));
-                        if (point_step > 12)
-                        {
-                            std::memset(p + 12, 0, point_step - 12);
-                        }
-                        ++written;
-                    }
-                }
-            }
-            dmabuf->sync_end();
-            if (!use_pool)
-            {
-                dmabuf->unmap();
-            }
+        dmabuf->sync_start();
+        const size_t written = packPointsToBuffer(
+            static_cast<uint8_t*>(dmabuf->addr()), layout, vertex, color_point, pc_size, texture_ptr);
+        dmabuf->sync_end();
+
+        if (written == 0 && !_ordered_pc)
+        {
+            return;
         }
 
         auto qirp_msg = std::make_unique<qrb_ros::transport::type::PointCloud2>();
         qirp_msg->header.stamp = t;
         qirp_msg->header.frame_id = frame_id;
-        qirp_msg->fields = std::move(layout.fields);
+        qirp_msg->fields = layout.fields;
         qirp_msg->is_bigendian = layout.is_bigendian;
-        qirp_msg->point_step = point_step;
+        qirp_msg->point_step = layout.point_step;
         if (_ordered_pc)
         {
             qirp_msg->width = static_cast<uint32_t>(depth_intrin.width);

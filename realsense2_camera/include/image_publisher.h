@@ -18,27 +18,33 @@
 #include <sensor_msgs/msg/image.hpp>
 
 #include <image_transport/image_transport.hpp>
+#include "dmabuf_pool.h"
 
 #ifdef BUILD_WITH_QIRP
-#include "dmabuf_pool.h"
 #include <qrb_ros_transport_image_type/image.hpp>
 #include <qrb_ros_transport_image_type/image_utils.hpp>
 #endif
 
 namespace realsense2_camera {
+
+struct RawImageView
+{
+    std_msgs::msg::Header header;
+    int width{0};
+    int height{0};
+    std::string encoding;
+    int step{0};
+    const void* data{nullptr};
+};
+
 class image_publisher
 {
 public:
     virtual void publish( sensor_msgs::msg::Image::UniquePtr image_ptr ) = 0;
     virtual bool supports_raw_publish() const { return false; }
-    virtual bool publish_raw( const std_msgs::msg::Header & header,
-                              int width,
-                              int height,
-                              const std::string & encoding,
-                              int step,
-                              const void * data )
+    virtual bool publish_raw( const RawImageView & view )
     {
-        (void)header; (void)width; (void)height; (void)encoding; (void)step; (void)data;
+        (void)view;
         return false;
     }
     virtual size_t get_subscription_count() const = 0;
@@ -82,21 +88,29 @@ public:
     image_qirp_publisher( RosNodeBase & node,
                           const std::string & topic_name,
                           const rmw_qos_profile_t & qos,
-                          std::size_t pool_size = 8 );
+                          std::size_t pool_size = qirp_defaults::kDefaultPoolSize );
     void publish( sensor_msgs::msg::Image::UniquePtr image_ptr ) override;
     bool supports_raw_publish() const override { return true; }
-    bool publish_raw( const std_msgs::msg::Header & header,
-                      int width,
-                      int height,
-                      const std::string & encoding,
-                      int step,
-                      const void * data ) override;
+    bool publish_raw( const RawImageView & view ) override;
     size_t get_subscription_count() const override;
 
 private:
+    std::shared_ptr<lib_mem_dmabuf::DmaBuffer> copy_rgb8_to_dmabuf( const RawImageView & view,
+                                                                    int align_size );
+
     rclcpp::Publisher< qrb_ros::transport::type::Image >::SharedPtr image_publisher_impl;
     DmaBufferPool _dmabuf_pool;
 };
 #endif
+
+// Factory that selects QIRP DMA-BUF, native RCL (intra-process/lifecycle), or image_transport publisher.
+std::shared_ptr<image_publisher> create_image_publisher( RosNodeBase & node,
+                                                         const std::string & topic_name,
+                                                         const rmw_qos_profile_t & qos,
+                                                         bool use_intra_process,
+                                                         bool use_qirp_transport,
+                                                         const std::string & ros_encoding,
+                                                         std::size_t qirp_pool_size,
+                                                         bool & created_qirp_out );
 
 }  // namespace realsense2_camera

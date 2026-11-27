@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "../include/base_realsense_node.h"
+#include "../include/dmabuf_pool.h"
 #include <ros_utils.h>
 #include <iomanip>
 
@@ -97,20 +98,29 @@ void BaseRealSenseNode::getParameters()
     _tf_prefix = _parameters->setParam<std::string>(param_name, "");
     _parameters_names.push_back(param_name);
 
-    param_name = std::string("use_qirp_transport");
-    _use_qirp_transport = _parameters->setParam<bool>(param_name, false);
-    _parameters_names.push_back(param_name);
-
-    param_name = std::string("qirp_dmabuf_pool_size");
-    _qirp_dmabuf_pool_size = static_cast<int>(_parameters->setParam<int>(param_name, 8));
-    if (_qirp_dmabuf_pool_size < 0 || _qirp_dmabuf_pool_size > 32)
     {
-        const int clamped = std::max(0, std::min(32, _qirp_dmabuf_pool_size));
-        ROS_WARN_STREAM("qirp_dmabuf_pool_size " << _qirp_dmabuf_pool_size
-                        << " out of [0,32]; clamping to " << clamped);
-        _qirp_dmabuf_pool_size = clamped;
+        rcl_interfaces::msg::ParameterDescriptor qirp_desc;
+        qirp_desc.description = "Enable Qualcomm QIRP DMA-BUF Zero-Copy transport (startup-only).";
+        qirp_desc.read_only = true;
+        param_name = std::string("use_qirp_transport");
+        _use_qirp_transport = _parameters->setParam<bool>(param_name, false, {}, qirp_desc);
+        _parameters_names.push_back(param_name);
     }
-    _parameters_names.push_back(param_name);
+
+    {
+        rcl_interfaces::msg::ParameterDescriptor pool_desc;
+        pool_desc.description = "Pre-mapped DMA-BUF ring pool slot count per QIRP publisher (0 disables pooling, startup-only).";
+        pool_desc.read_only = true;
+        rcl_interfaces::msg::IntegerRange pool_range;
+        pool_range.from_value = 0;
+        pool_range.to_value = static_cast<int64_t>(qirp_defaults::kMaxPoolSize);
+        pool_range.step = 1;
+        pool_desc.integer_range.push_back(pool_range);
+        param_name = std::string("qirp_dmabuf_pool_size");
+        _qirp_dmabuf_pool_size = static_cast<int>(
+            _parameters->setParam<int>(param_name, static_cast<int>(qirp_defaults::kDefaultPoolSize), {}, pool_desc));
+        _parameters_names.push_back(param_name);
+    }
 #ifndef BUILD_WITH_QIRP
     if (_use_qirp_transport)
     {

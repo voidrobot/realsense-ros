@@ -79,65 +79,81 @@ image_qirp_publisher::image_qirp_publisher( RosNodeBase & node,
         rclcpp::QoS( rclcpp::QoSInitialization::from_rmw( qos ), qos ) );
 }
 
-bool image_qirp_publisher::publish_raw( const std_msgs::msg::Header & header,
-                                        int width,
-                                        int height,
-                                        const std::string & encoding,
-                                        int step,
-                                        const void * data )
+std::shared_ptr<lib_mem_dmabuf::DmaBuffer> image_qirp_publisher::copy_rgb8_to_dmabuf(
+    const RawImageView & view,
+    int align_size )
 {
-    if (!data || width <= 0 || height <= 0 || step <= 0)
+    constexpr int kRgb8BytesPerPixel = 3;
+    const int row_bytes = view.width * kRgb8BytesPerPixel;
+    const int dst_stride = qrb_ros::transport::image_utils::get_image_stride(view.width, view.encoding);
+    if (row_bytes <= 0 || dst_stride < row_bytes || view.step < row_bytes)
+        return nullptr;
+
+    // Enforce stride * height <= aligned DMA-BUF size invariant before writing.
+    const std::size_t required_write_bytes =
+        static_cast<std::size_t>(view.height) * static_cast<std::size_t>(dst_stride);
+    if (required_write_bytes > static_cast<std::size_t>(align_size))
+        return nullptr;
+
+    auto dmabuf = _dmabuf_pool.acquire(static_cast<std::size_t>(align_size));
+    if (!dmabuf || !dmabuf->addr())
+        return nullptr;
+
+    dmabuf->sync_start();
+    auto* dst = static_cast<uint8_t*>(dmabuf->addr());
+    const auto* src = static_cast<const uint8_t*>(view.data);
+    if (dst_stride == row_bytes && view.step == row_bytes)
+    {
+        std::memcpy(dst, src, static_cast<std::size_t>(view.height) * static_cast<std::size_t>(row_bytes));
+    }
+    else
+    {
+        for (int y = 0; y < view.height; ++y)
+        {
+            std::memcpy(dst + static_cast<std::size_t>(y) * static_cast<std::size_t>(dst_stride),
+                        src + static_cast<std::size_t>(y) * static_cast<std::size_t>(view.step),
+                        static_cast<std::size_t>(row_bytes));
+        }
+    }
+    dmabuf->sync_end();
+    return dmabuf;
+}
+
+bool image_qirp_publisher::publish_raw( const RawImageView & view )
+{
+    if (!view.data || view.width <= 0 || view.height <= 0 || view.step <= 0)
         return false;
-    if (!qrb_ros::transport::image_utils::is_support_encoding(encoding))
+    if (!qrb_ros::transport::image_utils::is_support_encoding(view.encoding))
         return false;
 
-    const int align_size = qrb_ros::transport::image_utils::get_image_align_size(width, height, encoding);
+    const int align_size = qrb_ros::transport::image_utils::get_image_align_size(
+        view.width, view.height, view.encoding);
     if (align_size <= 0)
         return false;
 
     std::shared_ptr<lib_mem_dmabuf::DmaBuffer> dmabuf;
-    if (encoding == sensor_msgs::image_encodings::RGB8 && _dmabuf_pool.max_slots() > 0)
+    if (view.encoding == sensor_msgs::image_encodings::RGB8 && _dmabuf_pool.max_slots() > 0)
     {
-        const int dst_stride = qrb_ros::transport::image_utils::get_image_stride(width, encoding);
-        if (dst_stride < step)
+        dmabuf = copy_rgb8_to_dmabuf(view, align_size);
+        if (!dmabuf)
             return false;
-
-        dmabuf = _dmabuf_pool.acquire(static_cast<std::size_t>(align_size));
-        if (!dmabuf || !dmabuf->addr())
-            return false;
-
-        dmabuf->sync_start();
-        auto* dst = static_cast<uint8_t*>(dmabuf->addr());
-        const auto* src = static_cast<const uint8_t*>(data);
-        if (dst_stride == step)
-        {
-            std::memcpy(dst, src, static_cast<std::size_t>(height) * static_cast<std::size_t>(step));
-        }
-        else
-        {
-            for (int y = 0; y < height; ++y)
-            {
-                std::memcpy(dst + static_cast<std::size_t>(y) * static_cast<std::size_t>(dst_stride),
-                            src + static_cast<std::size_t>(y) * static_cast<std::size_t>(step),
-                            static_cast<std::size_t>(step));
-            }
-        }
-        dmabuf->sync_end();
     }
     else
     {
-        dmabuf = lib_mem_dmabuf::DmaBuffer::alloc(static_cast<std::size_t>(align_size), "/dev/dma_heap/system");
+        dmabuf = lib_mem_dmabuf::DmaBuffer::alloc(
+            static_cast<std::size_t>(align_size), qirp_defaults::kDefaultDmaHeapPath);
         if (!dmabuf)
             return false;
-        if (!qrb_ros::transport::image_utils::save_image_to_dmabuf(dmabuf, data, width, height, step, encoding, true))
+        if (!qrb_ros::transport::image_utils::save_image_to_dmabuf(
+                dmabuf, view.data, view.width, view.height, view.step, view.encoding, true))
             return false;
     }
 
     auto qirp_msg = std::make_unique< qrb_ros::transport::type::Image >();
-    qirp_msg->header = header;
-    qirp_msg->width = width;
-    qirp_msg->height = height;
-    qirp_msg->encoding = encoding;
+    qirp_msg->header = view.header;
+    qirp_msg->width = view.width;
+    qirp_msg->height = view.height;
+    qirp_msg->encoding = view.encoding;
     qirp_msg->dmabuf = std::move(dmabuf);
 
     image_publisher_impl->publish( std::move( qirp_msg ) );
@@ -148,12 +164,14 @@ void image_qirp_publisher::publish( sensor_msgs::msg::Image::UniquePtr image_ptr
 {
     if (!image_ptr)
         return;
-    publish_raw(image_ptr->header,
-                static_cast<int>(image_ptr->width),
-                static_cast<int>(image_ptr->height),
-                image_ptr->encoding,
-                static_cast<int>(image_ptr->step),
-                image_ptr->data.data());
+    RawImageView view;
+    view.header = image_ptr->header;
+    view.width = static_cast<int>(image_ptr->width);
+    view.height = static_cast<int>(image_ptr->height);
+    view.encoding = image_ptr->encoding;
+    view.step = static_cast<int>(image_ptr->step);
+    view.data = image_ptr->data.data();
+    publish_raw(view);
 }
 
 size_t image_qirp_publisher::get_subscription_count() const
@@ -161,3 +179,38 @@ size_t image_qirp_publisher::get_subscription_count() const
     return image_publisher_impl->get_subscription_count();
 }
 #endif
+
+std::shared_ptr<image_publisher> realsense2_camera::create_image_publisher( RosNodeBase & node,
+                                                         const std::string & topic_name,
+                                                         const rmw_qos_profile_t & qos,
+                                                         bool use_intra_process,
+                                                         bool use_qirp_transport,
+                                                         const std::string & ros_encoding,
+                                                         std::size_t qirp_pool_size,
+                                                         bool & created_qirp_out )
+{
+    created_qirp_out = false;
+#ifdef BUILD_WITH_QIRP
+    if (use_qirp_transport && !ros_encoding.empty() &&
+        qrb_ros::transport::image_utils::is_support_encoding(ros_encoding))
+    {
+        created_qirp_out = true;
+        return std::make_shared<image_qirp_publisher>(node, topic_name, qos, qirp_pool_size);
+    }
+#else
+    (void)use_qirp_transport;
+    (void)ros_encoding;
+    (void)qirp_pool_size;
+#endif
+
+#ifdef USE_LIFECYCLE_NODE
+    (void)use_intra_process;
+    return std::make_shared<image_rcl_publisher>(node, topic_name, qos);
+#else
+    if (use_intra_process)
+    {
+        return std::make_shared<image_rcl_publisher>(node, topic_name, qos);
+    }
+    return std::make_shared<image_transport_publisher>(node, topic_name, qos);
+#endif
+}
